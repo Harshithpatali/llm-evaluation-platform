@@ -1,36 +1,23 @@
-"""
-Production-grade statistical drift engine.
-
-Responsibilities:
-- rolling score windows
-- Wasserstein distance
-- KS statistical testing
-- drift monitoring
-"""
-
 import json
 import logging
+import ssl
 
-from typing import (
-    Dict,
-    List,
-    Any
-)
+from typing import Dict, List
 
 import redis
 import numpy as np
 
 from scipy.stats import (
     ks_2samp,
-    wasserstein_distance
+    wasserstein_distance,
 )
 
 from config import settings
 
 
-# =====================================================
+# =========================================================
 # LOGGING
-# =====================================================
+# =========================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,249 +26,306 @@ logging.basicConfig(
         "%(levelname)s | "
         "%(name)s | "
         "%(message)s"
-    )
+    ),
 )
 
 logger = logging.getLogger(__name__)
 
 
-# =====================================================
+# =========================================================
 # REDIS CLIENT
-# =====================================================
+# =========================================================
 
-redis_client = redis.Redis(
-    host=settings.REDIS_HOST,
-    port=settings.REDIS_PORT,
-    password=settings.REDIS_PASSWORD,
+redis_client = redis.Redis.from_url(
+    settings.redis_url,
     decode_responses=True,
-    ssl=True
+    ssl_cert_reqs=ssl.CERT_NONE
 )
 
 
-# =====================================================
-# DRIFT CONFIGURATION
-# =====================================================
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
-BASELINE_WINDOW_SIZE = 5
+BASELINE_WINDOW_SIZE = 50
+CURRENT_WINDOW_SIZE = 50
 
-CURRENT_WINDOW_SIZE = 3
+DRIFT_THRESHOLD = 0.20
 
-KS_PVALUE_THRESHOLD = 0.05
-
-WASSERSTEIN_THRESHOLD = 1.5
+P_VALUE_THRESHOLD = 0.05
 
 
-# =====================================================
-# FETCH SCORES
-# =====================================================
+# =========================================================
+# FETCH EVALUATIONS
+# =========================================================
 
-def fetch_evaluation_scores() -> List[float]:
+def fetch_evaluations() -> List[Dict]:
     """
-    Fetch evaluation scores from Redis.
+    Fetch all evaluation records from Redis.
     """
 
-    raw_results = redis_client.lrange(
-        "evaluation_results",
-        0,
-        -1
-    )
+    try:
+
+        raw_records = redis_client.lrange(
+            "llm_evaluations",
+            0,
+            -1
+        )
+
+        parsed_records = [
+            json.loads(record)
+            for record in raw_records
+        ]
+
+        logger.info(
+            f"Fetched "
+            f"{len(parsed_records)} "
+            f"evaluations"
+        )
+
+        return parsed_records
+
+    except Exception as e:
+
+        logger.exception(
+            "Failed to fetch evaluations"
+        )
+
+        return []
+
+
+# =========================================================
+# EXTRACT SCORES
+# =========================================================
+
+def extract_scores(
+    evaluations: List[Dict]
+) -> List[float]:
+    """
+    Extract overall scores.
+    """
 
     scores = []
 
-    for item in raw_results:
+    for evaluation in evaluations:
 
-        try:
-
-            parsed = json.loads(item)
+        if "overall_score" in evaluation:
 
             scores.append(
-                parsed["overall_score"]
+                float(
+                    evaluation[
+                        "overall_score"
+                    ]
+                )
             )
-
-        except Exception:
-
-            continue
 
     return scores
 
 
-# =====================================================
-# CREATE WINDOWS
-# =====================================================
+# =========================================================
+# SPLIT WINDOWS
+# =========================================================
 
-def create_score_windows(
+def split_windows(
     scores: List[float]
-) -> Dict[str, List[float]]:
+):
     """
-    Create baseline/current windows.
+    Split into baseline/current windows.
     """
-
-    minimum_required = (
-        BASELINE_WINDOW_SIZE +
-        CURRENT_WINDOW_SIZE
-    )
-
-    if len(scores) < minimum_required:
-
-        raise ValueError(
-            "Not enough evaluation data "
-            "for drift analysis"
-        )
 
     baseline_window = scores[
-        -(minimum_required):
-        -CURRENT_WINDOW_SIZE
+        -(
+            BASELINE_WINDOW_SIZE
+            +
+            CURRENT_WINDOW_SIZE
+        ):-CURRENT_WINDOW_SIZE
     ]
 
     current_window = scores[
         -CURRENT_WINDOW_SIZE:
     ]
 
-    return {
-        "baseline": baseline_window,
-        "current": current_window
-    }
-
-
-# =====================================================
-# DRIFT DETECTION
-# =====================================================
-
-def run_drift_detection() -> Dict[str, Any]:
-    """
-    Run statistical drift analysis.
-    """
-
-    logger.info(
-        "Starting drift detection"
+    return (
+        baseline_window,
+        current_window
     )
+
+
+# =========================================================
+# DRIFT ANALYSIS
+# =========================================================
+
+def analyze_drift() -> Dict:
+    """
+    Main statistical drift analysis.
+    """
 
     try:
 
-        # ==========================================
-        # FETCH SCORES
-        # ==========================================
+        # =============================================
+        # FETCH DATA
+        # =============================================
 
-        scores = (
-            fetch_evaluation_scores()
+        evaluations = fetch_evaluations()
+
+        scores = extract_scores(
+            evaluations
         )
 
-        logger.info(
-            f"Loaded {len(scores)} scores"
+        # =============================================
+        # CHECK DATA SUFFICIENCY
+        # =============================================
+
+        minimum_required = (
+            BASELINE_WINDOW_SIZE
+            +
+            CURRENT_WINDOW_SIZE
         )
 
-        # ==========================================
-        # CREATE WINDOWS
-        # ==========================================
+        if len(scores) < minimum_required:
 
-        windows = (
-            create_score_windows(
-                scores
-            )
+            return {
+                "status": (
+                    "insufficient_data"
+                ),
+                "required": (
+                    minimum_required
+                ),
+                "current": len(scores),
+            }
+
+        # =============================================
+        # SPLIT WINDOWS
+        # =============================================
+
+        (
+            baseline_window,
+            current_window
+        ) = split_windows(scores)
+
+        # =============================================
+        # NUMPY ARRAYS
+        # =============================================
+
+        baseline_array = np.array(
+            baseline_window
         )
 
-        baseline_scores = (
-            windows["baseline"]
+        current_array = np.array(
+            current_window
         )
 
-        current_scores = (
-            windows["current"]
-        )
-
-        # ==========================================
-        # WASSERSTEIN DISTANCE
-        # ==========================================
-
-        wasserstein_value = (
-            wasserstein_distance(
-                baseline_scores,
-                current_scores
-            )
-        )
-
-        # ==========================================
+        # =============================================
         # KS TEST
-        # ==========================================
+        # =============================================
 
         ks_statistic, p_value = (
             ks_2samp(
-                baseline_scores,
-                current_scores
+                baseline_array,
+                current_array
             )
         )
 
-        # ==========================================
-        # DRIFT DECISION
-        # ==========================================
+        # =============================================
+        # WASSERSTEIN DISTANCE
+        # =============================================
 
-        drift_detected = (
-            p_value < KS_PVALUE_THRESHOLD
-            or
-            wasserstein_value >
-            WASSERSTEIN_THRESHOLD
+        wasserstein_score = (
+            wasserstein_distance(
+                baseline_array,
+                current_array
+            )
         )
 
-        # ==========================================
-        # SUMMARY STATS
-        # ==========================================
+        # =============================================
+        # MEAN COMPARISON
+        # =============================================
 
         baseline_mean = float(
-            np.mean(
-                baseline_scores
-            )
+            np.mean(baseline_array)
         )
 
         current_mean = float(
-            np.mean(
-                current_scores
-            )
+            np.mean(current_array)
         )
 
+        # =============================================
+        # DRIFT LOGIC
+        # =============================================
+
+        drift_detected = (
+
+            wasserstein_score
+            >
+            DRIFT_THRESHOLD
+
+            or
+
+            p_value
+            <
+            P_VALUE_THRESHOLD
+        )
+
+        # =============================================
+        # FINAL RESULT
+        # =============================================
+
         result = {
-            "drift_detected": (
-                drift_detected
-            ),
-            "wasserstein_distance": round(
-                wasserstein_value,
-                4
-            ),
-            "ks_statistic": round(
+
+            "drift_detected":
+                drift_detected,
+
+            "ks_statistic":
                 float(ks_statistic),
-                4
-            ),
-            "p_value": round(
+
+            "p_value":
                 float(p_value),
-                6
-            ),
-            "baseline_mean": round(
+
+            "wasserstein_distance":
+                float(wasserstein_score),
+
+            "baseline_mean":
                 baseline_mean,
-                3
-            ),
-            "current_mean": round(
+
+            "current_mean":
                 current_mean,
-                3
-            ),
-            "baseline_window_size": (
-                len(baseline_scores)
-            ),
-            "current_window_size": (
-                len(current_scores)
-            )
+
+            "baseline_size":
+                len(baseline_window),
+
+            "current_size":
+                len(current_window),
         }
 
         logger.info(
-            "Drift detection completed"
+            f"Drift analysis result: "
+            f"{result}"
         )
 
         return result
 
-    except Exception as error:
+    except Exception as e:
 
         logger.exception(
-            "Drift detection failed"
+            "Drift analysis failed"
         )
 
         return {
-            "status": "failed",
-            "error": str(error)
+            "error": str(e)
         }
+
+
+# =========================================================
+# MAIN TEST
+# =========================================================
+
+if __name__ == "__main__":
+
+    result = analyze_drift()
+
+    print(
+        json.dumps(
+            result,
+            indent=2
+        )
+    )

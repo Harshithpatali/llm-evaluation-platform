@@ -1,51 +1,35 @@
-"""
-Main FastAPI application.
-
-Production-Grade Asynchronous
-LLM Evaluation & Drift Detection Platform
-
-Responsibilities:
-- API routing
-- async inference handling
-- Celery task triggering
-- Prometheus metrics
-- drift monitoring
-- health checks
-- production logging
-"""
-
-from typing import Dict, Any
+import json
 import logging
+import ssl
 import time
 
-from fastapi import (
-    FastAPI,
-    HTTPException
+from contextlib import asynccontextmanager
+from typing import Dict
+
+import redis
+
+from tasks import evaluate_response
+from statistical_engine import analyze_drift
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+from groq import AsyncGroq
+
+from prometheus_client import (
+    Counter,
+    Histogram,
+    generate_latest,
 )
 
-from pydantic import (
-    BaseModel,
-    Field
-)
-
-from groq import Groq
-
-from prometheus_fastapi_instrumentator import (
-    Instrumentator
-)
+from fastapi.responses import Response
 
 from config import settings
 
-from tasks import evaluate_response
 
-from statistical_engine import (
-    run_drift_detection
-)
-
-
-# =====================================================
+# =========================================================
 # LOGGING CONFIGURATION
-# =====================================================
+# =========================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,49 +38,54 @@ logging.basicConfig(
         "%(levelname)s | "
         "%(name)s | "
         "%(message)s"
-    )
+    ),
 )
 
 logger = logging.getLogger(__name__)
 
 
-# =====================================================
-# FASTAPI APPLICATION INITIALIZATION
-# =====================================================
+# =========================================================
+# PROMETHEUS METRICS
+# =========================================================
 
-app = FastAPI(
-    title=settings.APP_NAME,
-    version=settings.API_VERSION,
-    description=(
-        "Production-Grade Asynchronous "
-        "LLM Evaluation & Drift Detection Platform"
-    )
+REQUEST_COUNT = Counter(
+    "inference_requests_total",
+    "Total inference requests"
+)
+
+REQUEST_LATENCY = Histogram(
+    "inference_request_latency_seconds",
+    "Inference latency"
 )
 
 
-# =====================================================
-# PROMETHEUS METRICS
-# =====================================================
-
-Instrumentator().instrument(app).expose(app)
-
-
-# =====================================================
+# =========================================================
 # GROQ CLIENT
-# =====================================================
+# =========================================================
 
-groq_client = Groq(
+groq_client = AsyncGroq(
     api_key=settings.GROQ_API_KEY
 )
 
 
-# =====================================================
-# REQUEST SCHEMA
-# =====================================================
+# =========================================================
+# REDIS CLIENT
+# =========================================================
+
+redis_client = redis.Redis.from_url(
+    settings.redis_url,
+    decode_responses=True,
+    ssl_cert_reqs=ssl.CERT_NONE
+)
+
+
+# =========================================================
+# PYDANTIC REQUEST MODEL
+# =========================================================
 
 class InferenceRequest(BaseModel):
     """
-    Request schema for inference API.
+    Input request schema.
     """
 
     prompt: str = Field(
@@ -107,85 +96,145 @@ class InferenceRequest(BaseModel):
     )
 
 
-# =====================================================
-# RESPONSE SCHEMA
-# =====================================================
+# =========================================================
+# PYDANTIC RESPONSE MODEL
+# =========================================================
 
 class InferenceResponse(BaseModel):
     """
-    Response schema for inference API.
+    API response schema.
     """
 
     response: str
 
-    latency_seconds: float
 
-    evaluation_status: str
+# =========================================================
+# APPLICATION LIFECYCLE
+# =========================================================
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
 
-# =====================================================
-# ROOT ENDPOINT
-# =====================================================
+    logger.info(
+        "Starting AI Reliability Platform Backend..."
+    )
 
-@app.get("/")
-async def root() -> Dict[str, str]:
-    """
-    Root endpoint.
-    """
+    yield
 
-    return {
-        "message": (
-            "Production LLM Evaluation "
-            "Platform Running"
-        )
-    }
+    logger.info(
+        "Shutting down backend..."
+    )
 
 
-# =====================================================
+# =========================================================
+# FASTAPI APP
+# =========================================================
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+
+# =========================================================
 # HEALTH ENDPOINT
-# =====================================================
+# =========================================================
 
 @app.get("/health")
 async def health_check() -> Dict[str, str]:
     """
     Health check endpoint.
-
-    Used by:
-    - Docker
-    - Render
-    - monitoring systems
     """
 
     return {
-        "status": "healthy",
-        "environment": settings.ENVIRONMENT
+        "status": "healthy"
     }
 
 
-# =====================================================
-# TEST ENDPOINT
-# =====================================================
+# =========================================================
+# METRICS ENDPOINT
+# =========================================================
 
-@app.get("/api/v1/test")
-async def test_endpoint() -> Dict[str, str]:
-    """
-    Basic API test endpoint.
-    """
+@app.get("/metrics")
+async def metrics():
 
-    logger.info(
-        "Test endpoint called"
+    return Response(
+        generate_latest(),
+        media_type="text/plain"
     )
 
-    return {
-        "message": (
-            "Backend operational"
+
+# =========================================================
+# EVALUATION HISTORY
+# =========================================================
+
+@app.get("/api/v1/evaluations")
+async def get_evaluations():
+    """
+    Fetch evaluation history.
+    """
+
+    try:
+
+        raw_records = redis_client.lrange(
+            "llm_evaluations",
+            0,
+            -1
         )
-    }
+
+        parsed_records = [
+            json.loads(record)
+            for record in raw_records
+        ]
+
+        return {
+            "evaluations": parsed_records
+        }
+
+    except Exception as e:
+
+        logger.exception(
+            "Failed to fetch evaluations"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
 
-# =====================================================
-# MAIN INFERENCE ENDPOINT
-# =====================================================
+# =========================================================
+# DRIFT ANALYSIS ENDPOINT
+# =========================================================
+
+@app.get("/api/v1/drift")
+async def drift_analysis():
+    """
+    Run statistical drift analysis.
+    """
+
+    try:
+
+        result = analyze_drift()
+
+        return result
+
+    except Exception as e:
+
+        logger.exception(
+            "Drift analysis failed"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+# =========================================================
+# INFERENCE ENDPOINT
+# =========================================================
 
 @app.post(
     "/api/v1/inference",
@@ -195,241 +244,70 @@ async def run_inference(
     request: InferenceRequest
 ) -> InferenceResponse:
     """
-    Main inference endpoint.
-
-    Flow:
-    -----
-    1. Validate request
-    2. Call Groq LLM
-    3. Return response immediately
-    4. Trigger async evaluation
+    Main async inference endpoint.
     """
 
-    logger.info(
-        "Received inference request"
-    )
-
-    logger.info(
-        f"Prompt length: "
-        f"{len(request.prompt)}"
-    )
+    REQUEST_COUNT.inc()
 
     start_time = time.time()
 
     try:
 
-        # ==========================================
-        # LLM API REQUEST
-        # ==========================================
-
-        completion = (
-            groq_client.chat.completions.create(
-                model=settings.GROQ_MODEL,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": request.prompt
-                    }
-                ],
-                temperature=0.3,
-                max_tokens=512
-            )
+        logger.info(
+            "Received inference request"
         )
 
-        # ==========================================
-        # RESPONSE EXTRACTION
-        # ==========================================
+        completion = await groq_client.chat.completions.create(
+            model=settings.GROQ_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": request.prompt
+                }
+            ],
+            temperature=0.3,
+            max_tokens=512,
+        )
 
-        generated_text = (
+        response_text = (
             completion.choices[0]
-            .message.content
+            .message
+            .content
         )
 
-        # ==========================================
-        # LATENCY CALCULATION
-        # ==========================================
+        latency = time.time() - start_time
 
-        latency = (
-            time.time() - start_time
+        REQUEST_LATENCY.observe(latency)
+
+        logger.info(
+            f"Inference completed in "
+            f"{latency:.2f} seconds"
+        )
+
+        # =============================================
+        # TRIGGER ASYNC EVALUATION
+        # =============================================
+
+        evaluate_response.delay(
+            request.prompt,
+            response_text
         )
 
         logger.info(
-            f"Inference completed "
-            f"in {latency:.3f} seconds"
+            "Async evaluation task queued"
         )
-
-        # ==========================================
-        # TRIGGER ASYNC EVALUATION
-        # ==========================================
-
-        try:
-
-            evaluate_response.delay(
-                request.prompt,
-                generated_text
-            )
-
-            logger.info(
-                "Async evaluation task queued"
-            )
-
-            evaluation_status = "queued"
-
-        except Exception as celery_error:
-
-            logger.exception(
-                "Failed to queue evaluation task"
-            )
-
-            evaluation_status = (
-                f"queue_failed: "
-                f"{str(celery_error)}"
-            )
-
-        # ==========================================
-        # IMMEDIATE RESPONSE
-        # ==========================================
 
         return InferenceResponse(
-            response=generated_text,
-            latency_seconds=round(
-                latency,
-                3
-            ),
-            evaluation_status=(
-                evaluation_status
-            )
+            response=response_text
         )
 
-    except Exception as error:
+    except Exception as e:
 
         logger.exception(
-            "Inference pipeline failed"
+            "Inference failed"
         )
 
         raise HTTPException(
             status_code=500,
-            detail={
-                "message": (
-                    "Inference request failed"
-                ),
-                "error": str(error)
-            }
+            detail=str(e)
         )
-
-
-# =====================================================
-# DRIFT DETECTION ENDPOINT
-# =====================================================
-
-@app.get("/api/v1/drift")
-async def drift_analysis() -> Dict[str, Any]:
-    """
-    Run statistical drift detection.
-
-    Compares:
-    - historical evaluation scores
-    - recent evaluation scores
-    """
-
-    logger.info(
-        "Drift analysis endpoint called"
-    )
-
-    result = run_drift_detection()
-
-    return result
-
-
-# =====================================================
-# RECENT EVALUATIONS ENDPOINT
-# =====================================================
-
-@app.get("/api/v1/recent-evaluations")
-async def recent_evaluations():
-    """
-    Retrieve latest evaluation results.
-    """
-
-    import redis
-    import json
-
-    try:
-
-        redis_client = redis.Redis(
-            host=settings.REDIS_HOST,
-            port=settings.REDIS_PORT,
-            decode_responses=True
-        )
-
-        raw_results = redis_client.lrange(
-            "evaluation_results",
-            -10,
-            -1
-        )
-
-        parsed_results = []
-
-        for item in raw_results:
-
-            try:
-
-                parsed_results.append(
-                    json.loads(item)
-                )
-
-            except Exception:
-
-                continue
-
-        return {
-            "count": len(parsed_results),
-            "results": parsed_results
-        }
-
-    except Exception as error:
-
-        logger.exception(
-            "Failed to fetch evaluations"
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(error)
-        )
-
-
-# =====================================================
-# STARTUP EVENT
-# =====================================================
-
-@app.on_event("startup")
-async def startup_event():
-    """
-    Startup initialization.
-    """
-
-    logger.info(
-        "Starting Production LLM "
-        "Evaluation Platform"
-    )
-
-    logger.info(
-        f"Environment: "
-        f"{settings.ENVIRONMENT}"
-    )
-
-
-# =====================================================
-# SHUTDOWN EVENT
-# =====================================================
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """
-    Graceful shutdown event.
-    """
-
-    logger.info(
-        "Shutting down platform"
-    )

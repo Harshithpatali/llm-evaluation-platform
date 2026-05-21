@@ -1,375 +1,301 @@
-"""
-Production Streamlit Frontend
-
-Responsibilities:
-- prompt submission
-- API communication
-- response visualization
-- drift monitoring
-- evaluation dashboard
-"""
-
+import pandas as pd
+import plotly.express as px
 import requests
 import streamlit as st
-import pandas as pd
 
 
-# =====================================================
-# PAGE CONFIGURATION
-# =====================================================
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+BACKEND_URL = (
+    "http://127.0.0.1:8000"
+)
+
+
+# =========================================================
+# PAGE CONFIG
+# =========================================================
 
 st.set_page_config(
     page_title=(
-        "LLM Evaluation Platform"
+        "AI Reliability Platform"
     ),
-    page_icon="🤖",
-    layout="wide"
+    layout="wide",
 )
 
 
-# =====================================================
-# BACKEND CONFIG
-# =====================================================
-
-BACKEND_URL = (
-    "http://backend:8000"
-)
-
-
-# =====================================================
+# =========================================================
 # TITLE
-# =====================================================
+# =========================================================
 
 st.title(
-    "Production LLM Evaluation Platform"
+    "Production AI Reliability Platform"
 )
 
 st.markdown(
     """
-AI Reliability Engineering Dashboard
-
-Features:
-- LLM inference
-- async evaluation
-- drift detection
-- monitoring analytics
-"""
+    Real-time AI observability,
+    evaluation, and drift monitoring.
+    """
 )
 
 
-# =====================================================
+# =========================================================
 # SIDEBAR
-# =====================================================
+# =========================================================
 
 st.sidebar.header(
-    "System Monitoring"
+    "System Status"
 )
 
 st.sidebar.success(
-    "Frontend Operational"
+    "Frontend Online"
 )
 
 
-# =====================================================
-# PROMPT INPUT
-# =====================================================
+# =========================================================
+# INFERENCE SECTION
+# =========================================================
 
-st.header("LLM Inference")
-
-user_prompt = st.text_area(
-    "Enter your prompt",
-    height=150,
-    placeholder=(
-        "Ask something..."
-    )
+st.header(
+    "LLM Inference"
 )
 
+prompt = st.text_area(
+    "Enter Prompt",
+    height=150
+)
 
-# =====================================================
-# RUN INFERENCE
-# =====================================================
+if st.button("Run Inference"):
 
-if st.button(
-    "Generate Response"
-):
+    if prompt.strip():
 
-    if not user_prompt.strip():
+        with st.spinner(
+            "Generating response..."
+        ):
 
-        st.warning(
-            "Please enter a prompt."
-        )
-
-    else:
-
-        try:
-
-            with st.spinner(
-                "Generating response..."
-            ):
+            try:
 
                 response = requests.post(
                     f"{BACKEND_URL}"
                     "/api/v1/inference",
                     json={
-                        "prompt": user_prompt
+                        "prompt": prompt
                     },
-                    timeout=60
+                    timeout=60,
                 )
-
-            if response.status_code == 200:
 
                 result = response.json()
 
-                st.success(
-                    "Inference completed"
-                )
-
-                # ==============================
-                # RESPONSE DISPLAY
-                # ==============================
-
                 st.subheader(
-                    "Generated Response"
+                    "Model Response"
                 )
 
                 st.write(
                     result["response"]
                 )
 
-                # ==============================
-                # METRICS
-                # ==============================
+            except Exception as e:
 
-                col1, col2 = st.columns(2)
-
-                with col1:
-
-                    st.metric(
-                        "Latency (s)",
-                        result[
-                            "latency_seconds"
-                        ]
-                    )
-
-                with col2:
-
-                    st.metric(
-                        "Evaluation Status",
-                        result[
-                            "evaluation_status"
-                        ]
-                    )
-
-            else:
-
-                st.error(
-                    f"Backend Error: "
-                    f"{response.text}"
-                )
-
-        except Exception as error:
-
-            st.exception(error)
+                st.error(str(e))
 
 
-# =====================================================
-# DRIFT DETECTION SECTION
-# =====================================================
+# =========================================================
+# EVALUATION HISTORY
+# =========================================================
 
 st.header(
-    "Drift Detection"
+    "Evaluation History"
 )
 
-if st.button(
-    "Run Drift Analysis"
-):
+try:
 
-    try:
+    response = requests.get(
+        f"{BACKEND_URL}"
+        "/api/v1/evaluations"
+    )
 
-        with st.spinner(
-            "Running drift analysis..."
-        ):
+    data = response.json()
 
-            response = requests.get(
-                f"{BACKEND_URL}"
-                "/api/v1/drift",
-                timeout=30
+    evaluations = data.get(
+        "evaluations",
+        []
+    )
+
+    if evaluations:
+
+        df = pd.DataFrame(
+            evaluations
+        )
+
+        st.dataframe(
+            df,
+            use_container_width=True
+        )
+
+        # =============================================
+        # SCORE TREND CHART
+        # =============================================
+
+        if "overall_score" in df.columns:
+
+            st.subheader(
+                "Overall Score Trend"
             )
 
-        if response.status_code == 200:
+            df["index"] = range(len(df))
 
-            drift_result = (
-                response.json()
+            fig = px.line(
+                df,
+                x="index",
+                y="overall_score",
+                title=(
+                    "LLM Quality Trend"
+                ),
             )
 
-            if (
-                "status" in drift_result
-                and
-                drift_result["status"]
-                == "failed"
-            ):
+            st.plotly_chart(
+                fig,
+                use_container_width=True
+            )
 
-                st.warning(
-                    drift_result[
-                        "error"
-                    ]
-                )
+except Exception as e:
 
-            else:
+    st.error(
+        f"Evaluation fetch failed: "
+        f"{e}"
+    )
 
-                st.success(
-                    "Drift analysis completed"
-                )
 
-                # ==============================
-                # DRIFT METRICS
-                # ==============================
+# =========================================================
+# DRIFT MONITORING
+# =========================================================
 
-                col1, col2 = st.columns(2)
+st.header(
+    "Statistical Drift Detection"
+)
 
-                with col1:
+try:
 
-                    st.metric(
-                        "Wasserstein Distance",
-                        drift_result[
-                            "wasserstein_distance"
-                        ]
-                    )
+    response = requests.get(
+        f"{BACKEND_URL}"
+        "/api/v1/drift"
+    )
 
-                    st.metric(
-                        "KS Statistic",
-                        drift_result[
-                            "ks_statistic"
-                        ]
-                    )
+    drift_data = response.json()
 
-                with col2:
+    if (
+        "drift_detected"
+        in drift_data
+    ):
 
-                    st.metric(
-                        "P-Value",
-                        drift_result[
-                            "p_value"
-                        ]
-                    )
+        drift_detected = (
+            drift_data[
+                "drift_detected"
+            ]
+        )
 
-                    st.metric(
-                        "Drift Detected",
-                        str(
-                            drift_result[
-                                "drift_detected"
-                            ]
-                        )
-                    )
+        if drift_detected:
 
-                # ==============================
-                # MEAN SCORES
-                # ==============================
-
-                st.subheader(
-                    "Score Distribution"
-                )
-
-                mean_df = pd.DataFrame({
-                    "Window": [
-                        "Baseline",
-                        "Current"
-                    ],
-                    "Mean Score": [
-                        drift_result[
-                            "baseline_mean"
-                        ],
-                        drift_result[
-                            "current_mean"
-                        ]
-                    ]
-                })
-
-                st.bar_chart(
-                    mean_df.set_index(
-                        "Window"
-                    )
-                )
+            st.error(
+                "Drift Detected"
+            )
 
         else:
 
-            st.error(
-                f"Drift API Error: "
-                f"{response.text}"
+            st.success(
+                "No Drift Detected"
             )
 
-    except Exception as error:
+        # =============================================
+        # METRICS
+        # =============================================
 
-        st.exception(error)
+        col1, col2, col3 = (
+            st.columns(3)
+        )
 
-
-# =====================================================
-# RECENT EVALUATIONS
-# =====================================================
-
-st.header(
-    "Recent Evaluations"
-)
-
-if st.button(
-    "Load Recent Evaluations"
-):
-
-    try:
-
-        with st.spinner(
-            "Loading evaluations..."
-        ):
-
-            response = requests.get(
-                f"{BACKEND_URL}"
-                "/api/v1/recent-evaluations",
-                timeout=30
+        col1.metric(
+            "KS Statistic",
+            round(
+                drift_data[
+                    "ks_statistic"
+                ],
+                4
             )
+        )
 
-        if response.status_code == 200:
-
-            data = response.json()
-
-            evaluations = (
-                data["results"]
+        col2.metric(
+            "P-Value",
+            round(
+                drift_data[
+                    "p_value"
+                ],
+                4
             )
+        )
 
-            if len(evaluations) == 0:
-
-                st.warning(
-                    "No evaluations found"
-                )
-
-            else:
-
-                df = pd.DataFrame(
-                    evaluations
-                )
-
-                st.dataframe(
-                    df,
-                    use_container_width=True
-                )
-
-        else:
-
-            st.error(
-                response.text
+        col3.metric(
+            "Wasserstein Distance",
+            round(
+                drift_data[
+                    "wasserstein_distance"
+                ],
+                4
             )
+        )
 
-    except Exception as error:
+        # =============================================
+        # MEAN COMPARISON
+        # =============================================
 
-        st.exception(error)
+        st.subheader(
+            "Distribution Comparison"
+        )
 
+        comparison_df = pd.DataFrame({
 
-# =====================================================
-# FOOTER
-# =====================================================
+            "Window": [
+                "Baseline",
+                "Current"
+            ],
 
-st.markdown("---")
+            "Mean Score": [
 
-st.caption(
-    "Production-Grade "
-    "Asynchronous LLM "
-    "Evaluation Platform"
-)
+                drift_data[
+                    "baseline_mean"
+                ],
+
+                drift_data[
+                    "current_mean"
+                ],
+            ],
+        })
+
+        fig = px.bar(
+            comparison_df,
+            x="Window",
+            y="Mean Score",
+            title=(
+                "Baseline vs Current"
+            ),
+        )
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True
+        )
+
+    else:
+
+        st.warning(
+            "Insufficient data "
+            "for drift analysis."
+        )
+
+except Exception as e:
+
+    st.error(
+        f"Drift analysis failed: {e}"
+    )

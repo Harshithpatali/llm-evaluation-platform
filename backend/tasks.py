@@ -1,35 +1,27 @@
-"""
-Production-grade Celery evaluation workers.
-
-Responsibilities:
-- async evaluation
-- Redis queue integration
-- judge LLM scoring
-- structured JSON parsing
-- Redis persistence
-"""
-
-from celery import Celery
-
-import logging
-import time
 import json
+import logging
+import ssl
 
-from typing import (
-    Dict,
-    Any
-)
+from datetime import datetime
+from typing import Dict
 
 import redis
 
+from celery import Celery
+
 from groq import Groq
+
+from pydantic import (
+    BaseModel,
+    ValidationError,
+)
 
 from config import settings
 
 
-# =====================================================
-# LOGGING
-# =====================================================
+# =========================================================
+# LOGGING CONFIGURATION
+# =========================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,293 +30,279 @@ logging.basicConfig(
         "%(levelname)s | "
         "%(name)s | "
         "%(message)s"
-    )
+    ),
 )
 
 logger = logging.getLogger(__name__)
 
 
-# =====================================================
-# REDIS URL
-# =====================================================
-
-REDIS_URL = (
-    f"rediss://:"
-    f"{settings.REDIS_PASSWORD}"
-    f"@{settings.REDIS_HOST}:"
-    f"{settings.REDIS_PORT}/0"
-)
-
-
-# =====================================================
+# =========================================================
 # REDIS CLIENT
-# =====================================================
+# =========================================================
 
-redis_client = redis.Redis(
-    host=settings.REDIS_HOST,
-    port=settings.REDIS_PORT,
-    password=settings.REDIS_PASSWORD,
+redis_client = redis.Redis.from_url(
+    settings.redis_url,
     decode_responses=True,
-    ssl=True
+    ssl_cert_reqs=ssl.CERT_NONE
 )
 
 
-# =====================================================
+# =========================================================
 # CELERY CONFIGURATION
-# =====================================================
+# =========================================================
 
 celery_app = Celery(
     "tasks",
-    broker=REDIS_URL,
-    backend=REDIS_URL
+    broker=settings.redis_url,
+    backend=settings.redis_url,
+)
+
+celery_app.conf.update(
+
+    broker_use_ssl={
+        "ssl_cert_reqs": ssl.CERT_NONE
+    },
+
+    redis_backend_use_ssl={
+        "ssl_cert_reqs": ssl.CERT_NONE
+    },
+
+    task_serializer="json",
+    accept_content=["json"],
+    result_serializer="json",
+
+    timezone="UTC",
+    enable_utc=True,
+
+    task_track_started=True,
+    task_time_limit=300,
+
+    worker_prefetch_multiplier=1,
+
+    result_expires=3600,
 )
 
 
-# =====================================================
+# =========================================================
 # GROQ CLIENT
-# =====================================================
+# =========================================================
 
 groq_client = Groq(
     api_key=settings.GROQ_API_KEY
 )
 
 
-# =====================================================
-# VALIDATION FUNCTION
-# =====================================================
+# =========================================================
+# PYDANTIC VALIDATION MODEL
+# =========================================================
 
-def validate_evaluation_output(
-    data: Dict[str, Any]
-) -> bool:
+class EvaluationResult(BaseModel):
+
+    accuracy: int
+    clarity: int
+    relevance: int
+    overall_score: float
+
+
+# =========================================================
+# JUDGE SYSTEM PROMPT
+# =========================================================
+
+JUDGE_SYSTEM_PROMPT = """
+You are a strict AI quality evaluator.
+
+You MUST return ONLY valid JSON.
+
+Evaluation Rubric:
+
+1. accuracy
+- factual correctness
+- score 1-10
+
+2. clarity
+- readability and explanation quality
+- score 1-10
+
+3. relevance
+- relevance to user prompt
+- score 1-10
+
+Compute:
+overall_score = average of all scores
+
+IMPORTANT:
+- Return ONLY JSON
+- No markdown
+- No explanations
+- No extra text
+
+Required JSON format:
+
+{
+  "accuracy": 8,
+  "clarity": 9,
+  "relevance": 8,
+  "overall_score": 8.3
+}
+"""
+
+
+# =========================================================
+# HELPER FUNCTION
+# =========================================================
+
+def extract_json(
+    raw_text: str
+) -> Dict:
     """
-    Validate structured judge output.
+    Robust JSON extraction helper.
     """
-
-    required_fields = [
-        "overall_score",
-        "accuracy",
-        "clarity",
-        "reasoning",
-        "helpfulness",
-        "explanation"
-    ]
-
-    for field in required_fields:
-
-        if field not in data:
-            return False
-
-    numeric_fields = [
-        "overall_score",
-        "accuracy",
-        "clarity",
-        "reasoning",
-        "helpfulness"
-    ]
-
-    for field in numeric_fields:
-
-        value = data[field]
-
-        if not isinstance(
-            value,
-            (int, float)
-        ):
-            return False
-
-        if value < 1 or value > 10:
-            return False
-
-    return True
-
-
-# =====================================================
-# MAIN EVALUATION TASK
-# =====================================================
-
-@celery_app.task
-def evaluate_response(
-    prompt: str,
-    response: str
-) -> Dict[str, Any]:
-    """
-    Async judge evaluation task.
-    """
-
-    logger.info(
-        "Starting evaluation task"
-    )
-
-    start_time = time.time()
 
     try:
 
-        # ==========================================
-        # JUDGE PROMPT
-        # ==========================================
+        start = raw_text.find("{")
+        end = raw_text.rfind("}") + 1
 
-        judge_prompt = f"""
-You are an expert AI evaluator.
+        json_text = raw_text[start:end]
 
-Evaluate the response according
-to the following rubric:
+        return json.loads(json_text)
 
-1. Accuracy
-2. Clarity
-3. Reasoning
-4. Helpfulness
+    except Exception as e:
 
-Return ONLY valid JSON.
-
-USER PROMPT:
-{prompt}
-
-MODEL RESPONSE:
-{response}
-
-JSON FORMAT:
-
-{{
-  "overall_score": number,
-  "accuracy": number,
-  "clarity": number,
-  "reasoning": number,
-  "helpfulness": number,
-  "explanation": "brief explanation"
-}}
-"""
-
-        logger.info(
-            "Sending evaluation request "
-            "to judge LLM"
+        logger.exception(
+            "JSON extraction failed"
         )
 
-        # ==========================================
-        # GROQ JUDGE REQUEST
-        # ==========================================
+        raise ValueError(
+            "Invalid JSON response"
+        ) from e
+
+
+# =========================================================
+# EVALUATION TASK
+# =========================================================
+
+@celery_app.task(name="evaluate_response")
+def evaluate_response(
+    prompt: str,
+    response: str
+) -> Dict:
+    """
+    Production-grade async evaluation task.
+    """
+
+    try:
+
+        logger.info(
+            "Starting async evaluation"
+        )
+
+        # =================================================
+        # BUILD EVALUATION PROMPT
+        # =================================================
+
+        evaluation_prompt = f"""
+        USER PROMPT:
+        {prompt}
+
+        MODEL RESPONSE:
+        {response}
+        """
+
+        # =================================================
+        # CALL JUDGE LLM
+        # =================================================
 
         completion = (
             groq_client.chat.completions.create(
-                model=settings.GROQ_MODEL,
+                model="llama-3.3-70b-versatile",
                 messages=[
                     {
+                        "role": "system",
+                        "content": (
+                            JUDGE_SYSTEM_PROMPT
+                        ),
+                    },
+                    {
                         "role": "user",
-                        "content": judge_prompt
-                    }
+                        "content": (
+                            evaluation_prompt
+                        ),
+                    },
                 ],
                 temperature=0,
-                max_tokens=300
+                max_tokens=256,
             )
         )
 
-        raw_output = (
-            completion.choices[0]
-            .message.content
+        # =================================================
+        # RAW OUTPUT
+        # =================================================
+
+        raw_result = (
+            completion
+            .choices[0]
+            .message
+            .content
         )
 
         logger.info(
-            "Judge response received"
+            f"Judge raw output: "
+            f"{raw_result}"
         )
 
-        # ==========================================
-        # PARSE JSON
-        # ==========================================
+        # =================================================
+        # EXTRACT JSON
+        # =================================================
 
-        try:
+        parsed_json = extract_json(
+            raw_result
+        )
 
-            parsed_output = json.loads(
-                raw_output
-            )
+        # =================================================
+        # VALIDATE SCHEMA
+        # =================================================
 
-        except json.JSONDecodeError:
-
-            logger.exception(
-                "Invalid JSON from judge"
-            )
-
-            return {
-                "status": "failed",
-                "error": (
-                    "Judge returned invalid JSON"
-                ),
-                "raw_output": raw_output
-            }
-
-        # ==========================================
-        # VALIDATE OUTPUT
-        # ==========================================
-
-        is_valid = (
-            validate_evaluation_output(
-                parsed_output
+        validated_result = (
+            EvaluationResult(
+                **parsed_json
             )
         )
 
-        if not is_valid:
+        # =================================================
+        # FINAL STRUCTURED RECORD
+        # =================================================
 
-            logger.error(
-                "Evaluation validation failed"
-            )
-
-            return {
-                "status": "failed",
-                "error": (
-                    "Invalid evaluation schema"
-                )
-            }
-
-        # ==========================================
-        # BUILD RESULT
-        # ==========================================
-
-        evaluation_result = {
+        evaluation_record = {
             "prompt": prompt,
             "response": response,
-            "overall_score": (
-                parsed_output[
-                    "overall_score"
-                ]
-            ),
             "accuracy": (
-                parsed_output[
-                    "accuracy"
-                ]
+                validated_result.accuracy
             ),
             "clarity": (
-                parsed_output[
-                    "clarity"
-                ]
+                validated_result.clarity
             ),
-            "reasoning": (
-                parsed_output[
-                    "reasoning"
-                ]
+            "relevance": (
+                validated_result.relevance
             ),
-            "helpfulness": (
-                parsed_output[
-                    "helpfulness"
-                ]
+            "overall_score": (
+                validated_result
+                .overall_score
             ),
-            "explanation": (
-                parsed_output[
-                    "explanation"
-                ]
+            "timestamp": (
+                datetime.utcnow()
+                .isoformat()
             ),
-            "evaluation_latency": round(
-                time.time() - start_time,
-                3
-            ),
-            "timestamp": time.time()
         }
 
-        # ==========================================
+        # =================================================
         # STORE IN REDIS
-        # ==========================================
+        # =================================================
 
         redis_client.rpush(
-            "evaluation_results",
+            "llm_evaluations",
             json.dumps(
-                evaluation_result
+                evaluation_record
             )
         )
 
@@ -332,20 +310,25 @@ JSON FORMAT:
             "Evaluation stored successfully"
         )
 
+        return evaluation_record
+
+    except ValidationError as e:
+
+        logger.exception(
+            "Schema validation failed"
+        )
+
         return {
-            "status": "success",
-            "evaluation": (
-                evaluation_result
-            )
+            "error": "Schema validation failed",
+            "details": str(e)
         }
 
-    except Exception as error:
+    except Exception as e:
 
         logger.exception(
             "Evaluation task failed"
         )
 
         return {
-            "status": "failed",
-            "error": str(error)
+            "error": str(e)
         }
