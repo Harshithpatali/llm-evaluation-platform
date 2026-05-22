@@ -20,7 +20,7 @@ st.set_page_config(
 # API CONFIGURATION
 # =========================================================
 
-API_BASE_URL = "http://localhost:8000"
+API_BASE_URL = "https://llm-evaluation-platform-1.onrender.com"
 
 
 # =========================================================
