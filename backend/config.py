@@ -1,57 +1,58 @@
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
+from pydantic_settings import BaseSettings
+from pydantic import Field
 
 
-class Settings:
+class Settings(BaseSettings):
 
-    APP_NAME: str = (
-        "AI Reliability Platform"
-    )
+    # =========================================
+    # ENVIRONMENT
+    # =========================================
 
-    ENVIRONMENT: str = os.getenv(
-        "ENVIRONMENT",
-        "development"
-    )
+    ENVIRONMENT: str = Field(default="development")
 
-    GROQ_API_KEY: str = os.getenv(
-        "GROQ_API_KEY",
-        ""
-    )
+    # =========================================
+    # GROQ
+    # =========================================
 
-    REDIS_HOST: str = os.getenv(
-        "REDIS_HOST",
-        ""
-    )
+    GROQ_API_KEY: str
 
-    REDIS_PORT: int = int(
-        os.getenv("REDIS_PORT", 6379)
-    )
+    # =========================================
+    # REDIS
+    # =========================================
 
-    REDIS_PASSWORD: str = os.getenv(
-        "REDIS_PASSWORD",
-        ""
-    )
+    REDIS_HOST: str
 
-    GROQ_MODEL: str = (
-        "llama-3.3-70b-versatile"
-    )
+    REDIS_PORT: int = 6379
 
-    REQUEST_TIMEOUT: int = 30
+    REDIS_PASSWORD: str
+
+    # =========================================
+    # APP
+    # =========================================
+
+    APP_NAME: str = "LLM Reliability Platform"
+
+    LOG_LEVEL: str = "INFO"
+
+    # =========================================
+    # REDIS TLS URL
+    # =========================================
 
     @property
-    def redis_url(self) -> str:
+    def REDIS_URL(self) -> str:
 
         return (
             f"rediss://:"
             f"{self.REDIS_PASSWORD}"
-            f"@"
-            f"{self.REDIS_HOST}"
-            f":"
+            f"@{self.REDIS_HOST}:"
             f"{self.REDIS_PORT}"
-            f"/0"
+            f"?ssl_cert_reqs=required"
         )
+
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
 
 
 settings = Settings()
+print("GROQ:", settings.GROQ_API_KEY[:10])

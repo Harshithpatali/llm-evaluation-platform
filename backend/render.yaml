@@ -1,0 +1,54 @@
+services:
+
+  - type: web
+    name: llm-reliability-backend
+
+    runtime: docker
+
+    plan: free
+
+    dockerfilePath: ./Dockerfile
+
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+
+      - key: REDIS_HOST
+        sync: false
+
+      - key: REDIS_PORT
+        sync: false
+
+      - key: REDIS_PASSWORD
+        sync: false
+
+      - key: ENVIRONMENT
+        value: production
+
+
+  - type: worker
+    name: llm-reliability-worker
+
+    runtime: docker
+
+    plan: free
+
+    dockerfilePath: ./Dockerfile
+
+    dockerCommand: celery -A tasks worker --loglevel=info
+
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+
+      - key: REDIS_HOST
+        sync: false
+
+      - key: REDIS_PORT
+        sync: false
+
+      - key: REDIS_PASSWORD
+        sync: false
+
+      - key: ENVIRONMENT
+        value: production

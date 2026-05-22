@@ -2,29 +2,15 @@ version: "3.9"
 
 services:
 
-  # ==========================================
-  # REDIS
-  # ==========================================
-
-  redis:
-    image: redis:latest
-
-    container_name: redis-server
-
-    ports:
-      - "6379:6379"
-
-    restart: always
-
-
-  # ==========================================
-  # FASTAPI BACKEND
-  # ==========================================
-
   backend:
     build: .
 
-    container_name: fastapi-backend
+    container_name: llm_backend
+
+    command: >
+      uvicorn app:app
+      --host 0.0.0.0
+      --port 8000
 
     ports:
       - "8000:8000"
@@ -32,57 +18,19 @@ services:
     env_file:
       - .env
 
-    depends_on:
-      - redis
-
     restart: always
 
-
-  # ==========================================
-  # CELERY WORKER
-  # ==========================================
 
   celery_worker:
     build: .
 
-    container_name: celery-worker
+    container_name: llm_worker
 
-    command:
-      [
-        "celery",
-        "-A",
-        "tasks",
-        "worker",
-        "--pool=solo",
-        "--loglevel=info"
-      ]
+    command: >
+      celery -A tasks worker
+      --loglevel=info
 
     env_file:
       - .env
-
-    depends_on:
-      - redis
-      - backend
-
-    restart: always
-
-
-  # ==========================================
-  # STREAMLIT FRONTEND
-  # ==========================================
-
-  frontend:
-    build:
-      context: ../frontend
-
-      dockerfile: Dockerfile
-
-    container_name: streamlit-frontend
-
-    ports:
-      - "8501:8501"
-
-    depends_on:
-      - backend
 
     restart: always

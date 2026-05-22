@@ -1,47 +1,74 @@
 import json
 import logging
-import ssl
 import time
-
+import uuid
 from contextlib import asynccontextmanager
-from typing import Dict
 
 import redis
+import structlog
 
-from tasks import evaluate_response
-from statistical_engine import analyze_drift
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Request,
+)
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi.responses import (
+    JSONResponse,
+    Response,
+)
 
-from groq import AsyncGroq
+from pydantic import (
+    BaseModel,
+    Field,
+)
 
 from prometheus_client import (
     Counter,
     Histogram,
     generate_latest,
+    CONTENT_TYPE_LATEST,
 )
 
-from fastapi.responses import Response
+from groq import Groq
 
 from config import settings
+from tasks import evaluate_llm_output
+from statistical_engine import analyze_drift
 
 
 # =========================================================
-# LOGGING CONFIGURATION
+# STRUCTURED LOGGING
 # =========================================================
 
 logging.basicConfig(
+    format="%(message)s",
     level=logging.INFO,
-    format=(
-        "%(asctime)s | "
-        "%(levelname)s | "
-        "%(name)s | "
-        "%(message)s"
-    ),
 )
 
-logger = logging.getLogger(__name__)
+structlog.configure(
+    processors=[
+        structlog.processors.TimeStamper(
+            fmt="iso"
+        ),
+        structlog.processors.JSONRenderer(),
+    ]
+)
+
+logger = structlog.get_logger()
+
+
+# =========================================================
+# REDIS CLIENT
+# =========================================================
+
+redis_client = redis.Redis(
+    host=settings.REDIS_HOST,
+    port=settings.REDIS_PORT,
+    password=settings.REDIS_PASSWORD,
+    ssl=True,
+    decode_responses=True,
+)
 
 
 # =========================================================
@@ -50,79 +77,36 @@ logger = logging.getLogger(__name__)
 
 REQUEST_COUNT = Counter(
     "inference_requests_total",
-    "Total inference requests"
+    "Total inference requests",
 )
 
 REQUEST_LATENCY = Histogram(
     "inference_request_latency_seconds",
-    "Inference latency"
+    "Inference request latency",
+)
+
+INFERENCE_FAILURES = Counter(
+    "inference_failures_total",
+    "Total inference failures",
 )
 
 
 # =========================================================
-# GROQ CLIENT
-# =========================================================
-
-groq_client = AsyncGroq(
-    api_key=settings.GROQ_API_KEY
-)
-
-
-# =========================================================
-# REDIS CLIENT
-# =========================================================
-
-redis_client = redis.Redis.from_url(
-    settings.redis_url,
-    decode_responses=True,
-    ssl_cert_reqs=ssl.CERT_NONE
-)
-
-
-# =========================================================
-# PYDANTIC REQUEST MODEL
-# =========================================================
-
-class InferenceRequest(BaseModel):
-    """
-    Input request schema.
-    """
-
-    prompt: str = Field(
-        ...,
-        min_length=1,
-        max_length=4000,
-        description="User prompt"
-    )
-
-
-# =========================================================
-# PYDANTIC RESPONSE MODEL
-# =========================================================
-
-class InferenceResponse(BaseModel):
-    """
-    API response schema.
-    """
-
-    response: str
-
-
-# =========================================================
-# APPLICATION LIFECYCLE
+# FASTAPI LIFESPAN
 # =========================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
     logger.info(
-        "Starting AI Reliability Platform Backend..."
+        "application_startup",
+        environment=settings.ENVIRONMENT,
     )
 
     yield
 
     logger.info(
-        "Shutting down backend..."
+        "application_shutdown"
     )
 
 
@@ -131,10 +115,71 @@ async def lifespan(app: FastAPI):
 # =========================================================
 
 app = FastAPI(
-    title=settings.APP_NAME,
+    title="LLM Reliability Platform",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
+
+
+# =========================================================
+# PYDANTIC MODELS
+# =========================================================
+
+class InferenceRequest(BaseModel):
+
+    prompt: str = Field(
+        ...,
+        min_length=1,
+        max_length=5000,
+    )
+
+    model: str = Field(
+        default="llama-3.1-8b-instant"
+    )
+
+
+class InferenceResponse(BaseModel):
+
+    request_id: str
+
+    response: str
+
+    latency_seconds: float
+
+
+# =========================================================
+# GROQ CLIENT
+# =========================================================
+
+groq_client = Groq(
+    api_key=settings.GROQ_API_KEY
+)
+
+
+# =========================================================
+# GLOBAL EXCEPTION HANDLER
+# =========================================================
+
+@app.exception_handler(Exception)
+async def global_exception_handler(
+    request: Request,
+    exc: Exception
+):
+
+    INFERENCE_FAILURES.inc()
+
+    logger.error(
+        "unhandled_exception",
+        error=str(exc),
+        path=request.url.path,
+    )
+
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error"
+        },
+    )
 
 
 # =========================================================
@@ -142,13 +187,11 @@ app = FastAPI(
 # =========================================================
 
 @app.get("/health")
-async def health_check() -> Dict[str, str]:
-    """
-    Health check endpoint.
-    """
+async def health_check():
 
     return {
-        "status": "healthy"
+        "status": "healthy",
+        "environment": settings.ENVIRONMENT,
     }
 
 
@@ -161,47 +204,8 @@ async def metrics():
 
     return Response(
         generate_latest(),
-        media_type="text/plain"
+        media_type=CONTENT_TYPE_LATEST,
     )
-
-
-# =========================================================
-# EVALUATION HISTORY
-# =========================================================
-
-@app.get("/api/v1/evaluations")
-async def get_evaluations():
-    """
-    Fetch evaluation history.
-    """
-
-    try:
-
-        raw_records = redis_client.lrange(
-            "llm_evaluations",
-            0,
-            -1
-        )
-
-        parsed_records = [
-            json.loads(record)
-            for record in raw_records
-        ]
-
-        return {
-            "evaluations": parsed_records
-        }
-
-    except Exception as e:
-
-        logger.exception(
-            "Failed to fetch evaluations"
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
 
 
 # =========================================================
@@ -210,104 +214,173 @@ async def get_evaluations():
 
 @app.get("/api/v1/drift")
 async def drift_analysis():
-    """
-    Run statistical drift analysis.
-    """
 
     try:
 
-        result = analyze_drift()
+        analysis = analyze_drift()
 
-        return result
+        return analysis
 
     except Exception as e:
 
-        logger.exception(
-            "Drift analysis failed"
+        logger.error(
+            "drift_endpoint_failed",
+            error=str(e),
         )
 
         raise HTTPException(
             status_code=500,
-            detail=str(e)
+            detail="Drift analysis failed",
         )
 
 
 # =========================================================
-# INFERENCE ENDPOINT
+# EVALUATION HISTORY ENDPOINT
+# =========================================================
+
+@app.get("/api/v1/evaluations")
+async def get_evaluation_history():
+
+    """
+    Historical evaluation telemetry endpoint.
+    """
+
+    try:
+
+        raw_data = redis_client.lrange(
+            "llm:evaluations",
+            0,
+            -1,
+        )
+
+        evaluations = []
+
+        for item in raw_data:
+
+            try:
+
+                evaluations.append(
+                    json.loads(item)
+                )
+
+            except Exception as e:
+
+                logger.error(
+                    "evaluation_parse_failed",
+                    error=str(e),
+                )
+
+        return {
+            "count": len(evaluations),
+            "evaluations": evaluations,
+        }
+
+    except Exception as e:
+
+        logger.error(
+            "evaluation_history_failed",
+            error=str(e),
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to load evaluations",
+        )
+
+
+# =========================================================
+# MAIN INFERENCE ENDPOINT
 # =========================================================
 
 @app.post(
     "/api/v1/inference",
-    response_model=InferenceResponse
+    response_model=InferenceResponse,
 )
 async def run_inference(
-    request: InferenceRequest
-) -> InferenceResponse:
-    """
-    Main async inference endpoint.
-    """
+    payload: InferenceRequest
+):
 
     REQUEST_COUNT.inc()
 
-    start_time = time.time()
+    request_id = str(uuid.uuid4())
+
+    start_time = time.perf_counter()
+
+    logger.info(
+        "inference_started",
+        request_id=request_id,
+        model=payload.model,
+    )
 
     try:
 
-        logger.info(
-            "Received inference request"
+        # =========================================
+        # PRIMARY LLM INFERENCE
+        # =========================================
+
+        completion = (
+            groq_client.chat.completions.create(
+                model=payload.model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": payload.prompt,
+                    }
+                ],
+                temperature=0.2,
+            )
         )
 
-        completion = await groq_client.chat.completions.create(
-            model=settings.GROQ_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": request.prompt
-                }
-            ],
-            temperature=0.3,
-            max_tokens=512,
-        )
-
-        response_text = (
+        model_response = (
             completion.choices[0]
             .message
             .content
         )
 
-        latency = time.time() - start_time
+        # =========================================
+        # ASYNC BACKGROUND EVALUATION
+        # =========================================
 
-        REQUEST_LATENCY.observe(latency)
-
-        logger.info(
-            f"Inference completed in "
-            f"{latency:.2f} seconds"
+        evaluate_llm_output.delay(
+            request_id=request_id,
+            prompt=payload.prompt,
+            response=model_response,
         )
 
-        # =============================================
-        # TRIGGER ASYNC EVALUATION
-        # =============================================
+        latency = (
+            time.perf_counter() - start_time
+        )
 
-        evaluate_response.delay(
-            request.prompt,
-            response_text
+        REQUEST_LATENCY.observe(
+            latency
         )
 
         logger.info(
-            "Async evaluation task queued"
+            "inference_completed",
+            request_id=request_id,
+            latency=latency,
         )
 
         return InferenceResponse(
-            response=response_text
+            request_id=request_id,
+            response=model_response,
+            latency_seconds=round(
+                latency,
+                3,
+            ),
         )
 
     except Exception as e:
 
-        logger.exception(
-            "Inference failed"
+        INFERENCE_FAILURES.inc()
+
+        logger.error(
+            "inference_failed",
+            request_id=request_id,
+            error=str(e),
         )
 
         raise HTTPException(
             status_code=500,
-            detail=str(e)
+            detail="Inference failed",
         )

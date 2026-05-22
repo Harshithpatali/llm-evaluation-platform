@@ -1,11 +1,9 @@
 import json
-import logging
-import ssl
-
-from typing import Dict, List
+from typing import Dict, List, Any
 
 import redis
 import numpy as np
+import structlog
 
 from scipy.stats import (
     ks_2samp,
@@ -15,317 +13,227 @@ from scipy.stats import (
 from config import settings
 
 
-# =========================================================
-# LOGGING
-# =========================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format=(
-        "%(asctime)s | "
-        "%(levelname)s | "
-        "%(name)s | "
-        "%(message)s"
-    ),
-)
-
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 
-# =========================================================
-# REDIS CLIENT
-# =========================================================
-
-redis_client = redis.Redis.from_url(
-    settings.redis_url,
+redis_client = redis.Redis(
+    host=settings.REDIS_HOST,
+    port=settings.REDIS_PORT,
+    password=settings.REDIS_PASSWORD,
+    ssl=True,
     decode_responses=True,
-    ssl_cert_reqs=ssl.CERT_NONE
 )
 
 
-# =========================================================
-# CONFIGURATION
-# =========================================================
+ROLLING_WINDOW_SIZE = 50
 
-BASELINE_WINDOW_SIZE = 50
-CURRENT_WINDOW_SIZE = 50
+BASELINE_WINDOW_SIZE = 200
 
-DRIFT_THRESHOLD = 0.20
+DRIFT_PVALUE_THRESHOLD = 0.05
 
-P_VALUE_THRESHOLD = 0.05
+WASSERSTEIN_ALERT_THRESHOLD = 1.5
 
 
-# =========================================================
-# FETCH EVALUATIONS
-# =========================================================
+def load_evaluation_telemetry() -> List[Dict[str, Any]]:
 
-def fetch_evaluations() -> List[Dict]:
-    """
-    Fetch all evaluation records from Redis.
-    """
+    raw_data = redis_client.lrange(
+        "llm:evaluations",
+        0,
+        -1,
+    )
 
-    try:
+    telemetry = []
 
-        raw_records = redis_client.lrange(
-            "llm_evaluations",
-            0,
-            -1
-        )
+    for item in raw_data:
 
-        parsed_records = [
-            json.loads(record)
-            for record in raw_records
-        ]
+        try:
+            telemetry.append(json.loads(item))
 
-        logger.info(
-            f"Fetched "
-            f"{len(parsed_records)} "
-            f"evaluations"
-        )
+        except Exception as e:
 
-        return parsed_records
+            logger.error(
+                "telemetry_parse_failed",
+                error=str(e),
+            )
 
-    except Exception as e:
+    return telemetry
 
-        logger.exception(
-            "Failed to fetch evaluations"
-        )
-
-        return []
-
-
-# =========================================================
-# EXTRACT SCORES
-# =========================================================
 
 def extract_scores(
-    evaluations: List[Dict]
+    telemetry: List[Dict[str, Any]]
 ) -> List[float]:
-    """
-    Extract overall scores.
-    """
 
     scores = []
 
-    for evaluation in evaluations:
+    for item in telemetry:
 
-        if "overall_score" in evaluation:
+        try:
 
-            scores.append(
-                float(
-                    evaluation[
-                        "overall_score"
-                    ]
-                )
+            score = (
+                item["evaluation"]
+                ["overall_score"]
+            )
+
+            scores.append(float(score))
+
+        except Exception as e:
+
+            logger.error(
+                "score_extraction_failed",
+                error=str(e),
             )
 
     return scores
 
 
-# =========================================================
-# SPLIT WINDOWS
-# =========================================================
-
-def split_windows(
+def generate_windows(
     scores: List[float]
 ):
-    """
-    Split into baseline/current windows.
-    """
 
-    baseline_window = scores[
+    if len(scores) < (
+        BASELINE_WINDOW_SIZE
+        + ROLLING_WINDOW_SIZE
+    ):
+        return None, None
+
+    baseline = scores[
         -(
             BASELINE_WINDOW_SIZE
-            +
-            CURRENT_WINDOW_SIZE
-        ):-CURRENT_WINDOW_SIZE
+            + ROLLING_WINDOW_SIZE
+        ):-ROLLING_WINDOW_SIZE
     ]
 
-    current_window = scores[
-        -CURRENT_WINDOW_SIZE:
+    recent = scores[
+        -ROLLING_WINDOW_SIZE:
     ]
 
-    return (
-        baseline_window,
-        current_window
+    return baseline, recent
+
+
+def compute_ks_test(
+    baseline: List[float],
+    recent: List[float],
+) -> Dict[str, float]:
+
+    statistic, p_value = ks_2samp(
+        baseline,
+        recent,
     )
 
+    return {
+        "ks_statistic": float(statistic),
+        "p_value": float(p_value),
+    }
 
-# =========================================================
-# DRIFT ANALYSIS
-# =========================================================
 
-def analyze_drift() -> Dict:
-    """
-    Main statistical drift analysis.
-    """
+def compute_wasserstein(
+    baseline: List[float],
+    recent: List[float],
+) -> float:
 
-    try:
+    distance = wasserstein_distance(
+        baseline,
+        recent,
+    )
 
-        # =============================================
-        # FETCH DATA
-        # =============================================
+    return float(distance)
 
-        evaluations = fetch_evaluations()
 
-        scores = extract_scores(
-            evaluations
-        )
+def analyze_drift() -> Dict[str, Any]:
 
-        # =============================================
-        # CHECK DATA SUFFICIENCY
-        # =============================================
+    logger.info(
+        "drift_analysis_started"
+    )
 
-        minimum_required = (
-            BASELINE_WINDOW_SIZE
-            +
-            CURRENT_WINDOW_SIZE
-        )
+    telemetry = (
+        load_evaluation_telemetry()
+    )
 
-        if len(scores) < minimum_required:
+    scores = extract_scores(
+        telemetry
+    )
 
-            return {
-                "status": (
-                    "insufficient_data"
-                ),
-                "required": (
-                    minimum_required
-                ),
-                "current": len(scores),
-            }
+    baseline, recent = (
+        generate_windows(scores)
+    )
 
-        # =============================================
-        # SPLIT WINDOWS
-        # =============================================
-
-        (
-            baseline_window,
-            current_window
-        ) = split_windows(scores)
-
-        # =============================================
-        # NUMPY ARRAYS
-        # =============================================
-
-        baseline_array = np.array(
-            baseline_window
-        )
-
-        current_array = np.array(
-            current_window
-        )
-
-        # =============================================
-        # KS TEST
-        # =============================================
-
-        ks_statistic, p_value = (
-            ks_2samp(
-                baseline_array,
-                current_array
-            )
-        )
-
-        # =============================================
-        # WASSERSTEIN DISTANCE
-        # =============================================
-
-        wasserstein_score = (
-            wasserstein_distance(
-                baseline_array,
-                current_array
-            )
-        )
-
-        # =============================================
-        # MEAN COMPARISON
-        # =============================================
-
-        baseline_mean = float(
-            np.mean(baseline_array)
-        )
-
-        current_mean = float(
-            np.mean(current_array)
-        )
-
-        # =============================================
-        # DRIFT LOGIC
-        # =============================================
-
-        drift_detected = (
-
-            wasserstein_score
-            >
-            DRIFT_THRESHOLD
-
-            or
-
-            p_value
-            <
-            P_VALUE_THRESHOLD
-        )
-
-        # =============================================
-        # FINAL RESULT
-        # =============================================
-
-        result = {
-
-            "drift_detected":
-                drift_detected,
-
-            "ks_statistic":
-                float(ks_statistic),
-
-            "p_value":
-                float(p_value),
-
-            "wasserstein_distance":
-                float(wasserstein_score),
-
-            "baseline_mean":
-                baseline_mean,
-
-            "current_mean":
-                current_mean,
-
-            "baseline_size":
-                len(baseline_window),
-
-            "current_size":
-                len(current_window),
-        }
-
-        logger.info(
-            f"Drift analysis result: "
-            f"{result}"
-        )
-
-        return result
-
-    except Exception as e:
-
-        logger.exception(
-            "Drift analysis failed"
-        )
+    if baseline is None:
 
         return {
-            "error": str(e)
+            "status": "insufficient_data",
+            "message": (
+                "Need more telemetry"
+            ),
         }
 
+    ks_results = compute_ks_test(
+        baseline,
+        recent,
+    )
 
-# =========================================================
-# MAIN TEST
-# =========================================================
-
-if __name__ == "__main__":
-
-    result = analyze_drift()
-
-    print(
-        json.dumps(
-            result,
-            indent=2
+    wasserstein = (
+        compute_wasserstein(
+            baseline,
+            recent,
         )
     )
+
+    baseline_mean = float(
+        np.mean(baseline)
+    )
+
+    recent_mean = float(
+        np.mean(recent)
+    )
+
+    drift_detected = (
+        ks_results["p_value"]
+        < DRIFT_PVALUE_THRESHOLD
+    )
+
+    severe_drift = (
+        wasserstein
+        > WASSERSTEIN_ALERT_THRESHOLD
+    )
+
+    analysis = {
+        "status": "success",
+
+        "telemetry_count": len(scores),
+
+        "baseline_mean": round(
+            baseline_mean,
+            3,
+        ),
+
+        "recent_mean": round(
+            recent_mean,
+            3,
+        ),
+
+        "ks_statistic": round(
+            ks_results["ks_statistic"],
+            4,
+        ),
+
+        "p_value": round(
+            ks_results["p_value"],
+            6,
+        ),
+
+        "wasserstein_distance": round(
+            wasserstein,
+            4,
+        ),
+
+        "drift_detected": drift_detected,
+
+        "severe_drift": severe_drift,
+    }
+
+    logger.info(
+        "drift_analysis_completed",
+        analysis=analysis,
+    )
+
+    return analysis

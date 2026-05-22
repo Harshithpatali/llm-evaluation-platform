@@ -1,44 +1,46 @@
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
 
 # =========================================================
-# CONFIGURATION
-# =========================================================
-
-BACKEND_URL = (
-    "http://127.0.0.1:8000"
-)
-
-
-# =========================================================
-# PAGE CONFIG
+# PAGE CONFIGURATION
 # =========================================================
 
 st.set_page_config(
-    page_title=(
-        "AI Reliability Platform"
-    ),
+    page_title="LLM Reliability Platform",
+    page_icon="📊",
     layout="wide",
 )
 
 
 # =========================================================
-# TITLE
+# API CONFIGURATION
+# =========================================================
+
+API_BASE_URL = "http://localhost:8000"
+
+
+# =========================================================
+# PAGE TITLE
 # =========================================================
 
 st.title(
-    "Production AI Reliability Platform"
+    "📊 Production AI Reliability Platform"
 )
 
-st.markdown(
-    """
-    Real-time AI observability,
-    evaluation, and drift monitoring.
-    """
-)
+st.markdown("""
+Enterprise-grade AI observability dashboard.
+
+Features:
+- LLM inference
+- asynchronous evaluation
+- drift detection
+- reliability analytics
+- statistical monitoring
+""")
 
 
 # =========================================================
@@ -46,11 +48,18 @@ st.markdown(
 # =========================================================
 
 st.sidebar.header(
-    "System Status"
+    "Platform Controls"
 )
 
-st.sidebar.success(
-    "Frontend Online"
+selected_model = st.sidebar.selectbox(
+    "Select Model",
+    [
+        "llama-3.1-8b-instant",
+    ],
+)
+
+refresh_button = st.sidebar.button(
+    "Refresh Dashboard"
 )
 
 
@@ -58,114 +67,102 @@ st.sidebar.success(
 # INFERENCE SECTION
 # =========================================================
 
-st.header(
-    "LLM Inference"
-)
+st.header("🚀 LLM Inference")
 
 prompt = st.text_area(
     "Enter Prompt",
-    height=150
+    height=150,
 )
 
 if st.button("Run Inference"):
 
-    if prompt.strip():
+    if not prompt.strip():
 
-        with st.spinner(
-            "Generating response..."
-        ):
+        st.warning(
+            "Prompt cannot be empty."
+        )
 
-            try:
+    else:
+
+        payload = {
+            "prompt": prompt,
+            "model": selected_model,
+        }
+
+        try:
+
+            with st.spinner(
+                "Running inference..."
+            ):
 
                 response = requests.post(
-                    f"{BACKEND_URL}"
-                    "/api/v1/inference",
-                    json={
-                        "prompt": prompt
-                    },
+                    f"{API_BASE_URL}/api/v1/inference",
+                    json=payload,
                     timeout=60,
                 )
 
-                result = response.json()
+            if response.status_code == 200:
+
+                data = response.json()
+
+                st.success(
+                    "Inference completed."
+                )
+
+                # =====================================
+                # RESPONSE
+                # =====================================
 
                 st.subheader(
-                    "Model Response"
+                    "LLM Response"
                 )
 
                 st.write(
-                    result["response"]
+                    data["response"]
                 )
 
-            except Exception as e:
+                # =====================================
+                # METADATA
+                # =====================================
 
-                st.error(str(e))
+                st.subheader(
+                    "Inference Metadata"
+                )
 
+                col1, col2 = st.columns(2)
 
-# =========================================================
-# EVALUATION HISTORY
-# =========================================================
+                with col1:
 
-st.header(
-    "Evaluation History"
-)
+                    st.metric(
+                        "Request ID",
+                        data["request_id"],
+                    )
 
-try:
+                with col2:
 
-    response = requests.get(
-        f"{BACKEND_URL}"
-        "/api/v1/evaluations"
-    )
+                    st.metric(
+                        "Latency (s)",
+                        data[
+                            "latency_seconds"
+                        ],
+                    )
 
-    data = response.json()
+            else:
 
-    evaluations = data.get(
-        "evaluations",
-        []
-    )
+                st.error(
+                    f"API Error: "
+                    f"{response.text}"
+                )
 
-    if evaluations:
+        except Exception as e:
 
-        df = pd.DataFrame(
-            evaluations
-        )
+            import traceback
 
-        st.dataframe(
-            df,
-            use_container_width=True
-        )
+            st.error(str(e))
 
-        # =============================================
-        # SCORE TREND CHART
-        # =============================================
-
-        if "overall_score" in df.columns:
-
-            st.subheader(
-                "Overall Score Trend"
+            st.code(
+                traceback.format_exc()
             )
-
-            df["index"] = range(len(df))
-
-            fig = px.line(
-                df,
-                x="index",
-                y="overall_score",
-                title=(
-                    "LLM Quality Trend"
-                ),
-            )
-
-            st.plotly_chart(
-                fig,
-                use_container_width=True
-            )
-
-except Exception as e:
-
-    st.error(
-        f"Evaluation fetch failed: "
-        f"{e}"
-    )
 
 
 # =========================================================
@@ -173,129 +170,378 @@ except Exception as e:
 # =========================================================
 
 st.header(
-    "Statistical Drift Detection"
+    "📈 Statistical Drift Monitoring"
 )
 
 try:
 
-    response = requests.get(
-        f"{BACKEND_URL}"
-        "/api/v1/drift"
+    drift_response = requests.get(
+        f"{API_BASE_URL}/api/v1/drift",
+        timeout=30,
     )
 
-    drift_data = response.json()
+    if drift_response.status_code == 200:
 
-    if (
-        "drift_detected"
-        in drift_data
-    ):
-
-        drift_detected = (
-            drift_data[
-                "drift_detected"
-            ]
+        drift_data = (
+            drift_response.json()
         )
 
-        if drift_detected:
+        # =====================================
+        # INSUFFICIENT DATA
+        # =====================================
 
-            st.error(
-                "Drift Detected"
+        if (
+            drift_data["status"]
+            == "insufficient_data"
+        ):
+
+            st.info(
+                drift_data["message"]
             )
 
         else:
 
-            st.success(
-                "No Drift Detected"
+            # =====================================
+            # METRICS
+            # =====================================
+
+            col1, col2, col3, col4 = (
+                st.columns(4)
             )
 
-        # =============================================
-        # METRICS
-        # =============================================
+            with col1:
 
-        col1, col2, col3 = (
-            st.columns(3)
-        )
+                st.metric(
+                    "Baseline Mean",
+                    drift_data[
+                        "baseline_mean"
+                    ],
+                )
 
-        col1.metric(
-            "KS Statistic",
-            round(
-                drift_data[
-                    "ks_statistic"
-                ],
-                4
+            with col2:
+
+                st.metric(
+                    "Recent Mean",
+                    drift_data[
+                        "recent_mean"
+                    ],
+                )
+
+            with col3:
+
+                st.metric(
+                    "KS Statistic",
+                    drift_data[
+                        "ks_statistic"
+                    ],
+                )
+
+            with col4:
+
+                st.metric(
+                    "Wasserstein",
+                    drift_data[
+                        "wasserstein_distance"
+                    ],
+                )
+
+            # =====================================
+            # DRIFT STATUS
+            # =====================================
+
+            if drift_data[
+                "drift_detected"
+            ]:
+
+                st.error(
+                    "⚠️ Drift Detected"
+                )
+
+            else:
+
+                st.success(
+                    "✅ System Stable"
+                )
+
+            if drift_data[
+                "severe_drift"
+            ]:
+
+                st.warning(
+                    "🚨 Severe Drift Detected"
+                )
+
+            # =====================================
+            # BAR CHART
+            # =====================================
+
+            st.subheader(
+                "📊 Drift Indicators"
             )
-        )
 
-        col2.metric(
-            "P-Value",
-            round(
-                drift_data[
-                    "p_value"
-                ],
-                4
+            drift_metrics_df = (
+                pd.DataFrame(
+                    {
+                        "Metric": [
+                            "Baseline Mean",
+                            "Recent Mean",
+                            "KS Statistic",
+                            "Wasserstein",
+                        ],
+                        "Value": [
+                            drift_data[
+                                "baseline_mean"
+                            ],
+                            drift_data[
+                                "recent_mean"
+                            ],
+                            drift_data[
+                                "ks_statistic"
+                            ],
+                            drift_data[
+                                "wasserstein_distance"
+                            ],
+                        ],
+                    }
+                )
             )
-        )
 
-        col3.metric(
-            "Wasserstein Distance",
-            round(
-                drift_data[
-                    "wasserstein_distance"
-                ],
-                4
+            fig = px.bar(
+                drift_metrics_df,
+                x="Metric",
+                y="Value",
+                title=(
+                    "AI Reliability Drift Metrics"
+                ),
             )
-        )
 
-        # =============================================
-        # MEAN COMPARISON
-        # =============================================
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+            )
 
-        st.subheader(
-            "Distribution Comparison"
-        )
+            # =====================================
+            # RELIABILITY GAUGE
+            # =====================================
 
-        comparison_df = pd.DataFrame({
-
-            "Window": [
-                "Baseline",
-                "Current"
-            ],
-
-            "Mean Score": [
-
+            reliability_score = (
                 drift_data[
-                    "baseline_mean"
-                ],
+                    "recent_mean"
+                ]
+            )
 
-                drift_data[
-                    "current_mean"
-                ],
-            ],
-        })
+            gauge = go.Figure(
+                go.Indicator(
+                    mode="gauge+number",
+                    value=reliability_score,
+                    title={
+                        "text": (
+                            "AI Reliability Score"
+                        )
+                    },
+                    gauge={
+                        "axis": {
+                            "range": [0, 10]
+                        },
+                    },
+                )
+            )
 
-        fig = px.bar(
-            comparison_df,
-            x="Window",
-            y="Mean Score",
-            title=(
-                "Baseline vs Current"
-            ),
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True
-        )
+            st.plotly_chart(
+                gauge,
+                use_container_width=True,
+            )
 
     else:
 
-        st.warning(
-            "Insufficient data "
-            "for drift analysis."
+        st.error(
+            "Failed to fetch drift analysis."
         )
 
 except Exception as e:
 
     st.error(
-        f"Drift analysis failed: {e}"
+        f"Drift endpoint error: {str(e)}"
+    )
+
+
+# =========================================================
+# PLATFORM HEALTH
+# =========================================================
+
+st.header("🩺 Platform Health")
+
+try:
+
+    health_response = requests.get(
+        f"{API_BASE_URL}/health",
+        timeout=10,
+    )
+
+    if health_response.status_code == 200:
+
+        health_data = (
+            health_response.json()
+        )
+
+        st.success(
+            f"Backend Status: "
+            f"{health_data['status']}"
+        )
+
+        st.json(health_data)
+
+    else:
+
+        st.error(
+            "Backend unhealthy."
+        )
+
+except Exception as e:
+
+    st.error(
+        f"Health check failed: {str(e)}"
+    )
+
+
+# =========================================================
+# EVALUATION HISTORY
+# =========================================================
+
+st.header("📜 Evaluation History")
+
+try:
+
+    evaluation_response = requests.get(
+        f"{API_BASE_URL}/api/v1/evaluations",
+        timeout=30,
+    )
+
+    if evaluation_response.status_code == 200:
+
+        evaluation_data = (
+            evaluation_response.json()
+        )
+
+        evaluations = (
+            evaluation_data["evaluations"]
+        )
+
+        # =====================================
+        # EMPTY STATE
+        # =====================================
+
+        if len(evaluations) == 0:
+
+            st.info(
+                "No evaluations available yet."
+            )
+
+        else:
+
+            st.success(
+                f"Loaded "
+                f"{len(evaluations)} evaluations"
+            )
+
+            # =====================================
+            # TABLE ROWS
+            # =====================================
+
+            table_rows = []
+
+            for item in evaluations:
+
+                try:
+
+                    row = {
+                        "timestamp": item[
+                            "timestamp"
+                        ],
+
+                        "prompt": item[
+                            "prompt"
+                        ][:50],
+
+                        "overall_score":
+                        item["evaluation"][
+                            "overall_score"
+                        ],
+
+                        "correctness":
+                        item["evaluation"][
+                            "correctness"
+                        ],
+
+                        "clarity":
+                        item["evaluation"][
+                            "clarity"
+                        ],
+
+                        "helpfulness":
+                        item["evaluation"][
+                            "helpfulness"
+                        ],
+
+                        "safety":
+                        item["evaluation"][
+                            "safety"
+                        ],
+
+                        "professionalism":
+                        item["evaluation"][
+                            "professionalism"
+                        ],
+                    }
+
+                    table_rows.append(row)
+
+                except Exception as e:
+
+                    st.error(str(e))
+
+            # =====================================
+            # DATAFRAME
+            # =====================================
+
+            history_df = pd.DataFrame(
+                table_rows
+            )
+
+            st.dataframe(
+                history_df,
+                use_container_width=True,
+            )
+
+            # =====================================
+            # TREND CHART
+            # =====================================
+
+            st.subheader(
+                "📈 Reliability Trend"
+            )
+
+            trend_fig = px.line(
+                history_df,
+                y="overall_score",
+                title=(
+                    "Overall Reliability Trend"
+                ),
+            )
+
+            st.plotly_chart(
+                trend_fig,
+                use_container_width=True,
+            )
+
+    else:
+
+        st.error(
+            "Failed to fetch evaluation history."
+        )
+
+except Exception as e:
+
+    st.error(
+        f"Evaluation history error: {str(e)}"
     )
